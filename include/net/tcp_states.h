@@ -48,7 +48,7 @@ enum {
 	TCPF_LISTEN	 = (1 << 10),
 	TCPF_CLOSING	 = (1 << 11),
 	TCPF_NEW_SYN_RECV = (1 << 12),
-	TCPF_RST_WAIT    = (1 << 13),
+	TCPF_RST_WAIT	 = (1 << 13),
 };
 
 #endif	/* _LINUX_TCP_STATES_H */

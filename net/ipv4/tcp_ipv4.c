@@ -397,6 +397,12 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	else
 		meta_sk = sk;
 
+	tp = tcp_sk(sk);
+	if (mptcp(tp))
+		meta_sk = mptcp_meta_sk(sk);
+	else
+		meta_sk = sk;
+
 	bh_lock_sock(meta_sk);
 	/* If too many ICMPs get dropped on busy
 	 * servers this needs to be solved differently.
@@ -836,7 +842,7 @@ static void tcp_v4_timewait_ack(struct sock *sk, struct sk_buff *skb)
 }
 
 void tcp_v4_reqsk_send_ack(const struct sock *sk, struct sk_buff *skb,
-			  struct request_sock *req)
+			   struct request_sock *req)
 {
 	/* sk->sk_state == TCP_LISTEN -> for regular TCP_SYN_RECV
 	 * sk->sk_state == TCP_SYN_RECV -> for Fast Open.
@@ -1668,8 +1674,29 @@ process:
 			reqsk_put(req);
 			goto discard_it;
 		}
-		// XXX: Simplify logic...
-		if (unlikely(sk->sk_state != TCP_LISTEN)) {
+		if (likely(sk->sk_state == TCP_LISTEN || is_meta_sk(sk))) {
+			if (is_meta_sk(sk)) {
+				bh_lock_sock(sk);
+
+				if (sock_owned_by_user(sk)) {
+					skb->sk = sk;
+					if (unlikely(sk_add_backlog(sk, skb,
+								    sk->sk_rcvbuf + sk->sk_sndbuf))) {
+						reqsk_put(req);
+
+						bh_unlock_sock(sk);
+						NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+						goto discard_and_relse;
+					}
+
+					reqsk_put(req);
+					bh_unlock_sock(sk);
+
+					return 0;
+				}
+			}
+			nsk = tcp_check_req(sk, skb, req, false);
+		} else {
 			inet_csk_reqsk_queue_drop_and_put(sk, req);
 			goto lookup;
 		}

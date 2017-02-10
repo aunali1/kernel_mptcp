@@ -95,6 +95,10 @@ static int num_subflows __read_mostly = 1;
 module_param(num_subflows, int, 0644);
 MODULE_PARM_DESC(num_subflows, "choose the number of subflows per pair of IP addresses of MPTCP connection");
 
+static int create_on_err __read_mostly;
+module_param(create_on_err, int, 0644);
+MODULE_PARM_DESC(create_on_err, "recreate the subflow upon a timeout");
+
 static struct mptcp_pm_ops full_mesh __read_mostly;
 
 static void full_mesh_create_subflows(struct sock *meta_sk);
@@ -612,7 +616,7 @@ static void update_addr_bitfields(struct sock *meta_sk,
 	int i;
 
 	/* The bits in announced_addrs_* always match with loc*_bits. So, a
-	 * simply & operation unsets the correct bits, because these go from
+	 * simple & operation unsets the correct bits, because these go from
 	 * announced to non-announced
 	 */
 	fmp->announced_addrs_v4 &= mptcp_local->loc4_bits;
@@ -1370,6 +1374,24 @@ static void full_mesh_create_subflows(struct sock *meta_sk)
 	}
 }
 
+static void full_mesh_subflow_error(struct sock *meta_sk, struct sock *sk)
+{
+	const struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+
+	if (!create_on_err)
+		return;
+
+	if (mpcb->infinite_mapping_snd || mpcb->infinite_mapping_rcv ||
+	    mpcb->send_infinite_mapping ||
+	    mpcb->server_side || sock_flag(meta_sk, SOCK_DEAD))
+		return;
+
+	if (sk->sk_err != ETIMEDOUT)
+		return;
+
+	full_mesh_create_subflows(meta_sk);
+}
+
 /* Called upon release_sock, if the socket was owned by the user during
  * a path-management event.
  */
@@ -1674,6 +1696,67 @@ static void full_mesh_rem_raddr(struct mptcp_cb *mpcb, u8 rem_id)
 	mptcp_v6_rem_raddress(mpcb, rem_id);
 }
 
+static void full_mesh_delete_subflow(struct sock *sk)
+{
+	struct fullmesh_priv *fmp = fullmesh_get_priv(tcp_sk(sk)->mpcb);
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
+	struct mptcp_loc_addr *mptcp_local;
+	int index, i;
+
+	if (!create_on_err)
+		return;
+
+	rcu_read_lock_bh();
+	mptcp_local = rcu_dereference_bh(fm_ns->local);
+
+	if (sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(sk)) {
+		union inet_addr saddr;
+
+		saddr.ip = inet_sk(sk)->inet_saddr;
+		index = mptcp_find_address(mptcp_local, AF_INET, &saddr,
+					   sk->sk_bound_dev_if);
+		if (index < 0)
+			goto out;
+
+		mptcp_for_each_bit_set(fmp->rem4_bits, i) {
+			struct fullmesh_rem4 *rem4 = &fmp->remaddr4[i];
+
+			if (rem4->addr.s_addr != sk->sk_daddr)
+				continue;
+
+			if (rem4->port && rem4->port != inet_sk(sk)->inet_dport)
+				continue;
+
+			rem4->bitfield &= ~(1 << index);
+		}
+#if IS_ENABLED(CONFIG_IPV6)
+	} else {
+		union inet_addr saddr;
+
+		saddr.in6 = inet6_sk(sk)->saddr;
+		index = mptcp_find_address(mptcp_local, AF_INET6, &saddr,
+					   sk->sk_bound_dev_if);
+		if (index < 0)
+			goto out;
+
+		mptcp_for_each_bit_set(fmp->rem6_bits, i) {
+			struct fullmesh_rem6 *rem6 = &fmp->remaddr6[i];
+
+			if (!ipv6_addr_equal(&rem6->addr, &sk->sk_v6_daddr))
+				continue;
+
+			if (rem6->port && rem6->port != inet_sk(sk)->inet_dport)
+				continue;
+
+			rem6->bitfield &= ~(1 << index);
+		}
+#endif
+	}
+
+out:
+	rcu_read_unlock_bh();
+}
+
 /* Output /proc/net/mptcp_fullmesh */
 static int mptcp_fm_seq_show(struct seq_file *seq, void *v)
 {
@@ -1799,10 +1882,12 @@ static struct mptcp_pm_ops full_mesh __read_mostly = {
 	.release_sock = full_mesh_release_sock,
 	.fully_established = full_mesh_create_subflows,
 	.new_remote_address = full_mesh_create_subflows,
+	.subflow_error = full_mesh_subflow_error,
 	.get_local_id = full_mesh_get_local_id,
 	.addr_signal = full_mesh_addr_signal,
 	.add_raddr = full_mesh_add_raddr,
 	.rem_raddr = full_mesh_rem_raddr,
+	.delete_subflow = full_mesh_delete_subflow,
 	.name = "fullmesh",
 	.owner = THIS_MODULE,
 };
